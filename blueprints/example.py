@@ -1,24 +1,25 @@
 import numpy as np
 import pandas as pd
-from flask import Flask, Blueprint, render_template, request, jsonify, url_for
+import os
+import mysql.connector
+from flask import Flask, Blueprint, render_template, request, jsonify, url_for, redirect, send_file
+import plotly
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-
+import re
 import socket
 import json
-import plotly
-import os
-import mysql.connector
-from astropy.time import Time
 import requests
-
-from datetime import datetime, timedelta
-from glob import glob
+from pathlib import Path
 import subprocess
 import tempfile
+from astropy.time import Time
+from datetime import datetime, timedelta
+from glob import glob
 import shutil
-from pathlib import Path
+import os
+from imageio import imread
 
 ##=========================
 example = Blueprint('example', __name__, template_folder='templates')
@@ -89,9 +90,21 @@ def convert_local_to_urls(files_path):
         urls.append(url)
     return urls
 
+##=========================
+def convert_local_to_filename(files_path):
+    """
+    Convert local HDF paths to filename only.
+
+    Parameters:
+        files_path (list): List of local HDF file paths (str)
+
+    Returns:
+        list: List of converted file names
+    """
+    return [os.path.basename(path) for path in files_path]
 
 ##=========================
-# output_name="slow_hdf_movie.mp4"
+# output_name = "slow_hdf_movie.mp4"
 def generate_movie_from_pngs(png_files, output_name=None):
     if not png_files:
         return None
@@ -128,7 +141,7 @@ def generate_movie_from_pngs(png_files, output_name=None):
 ##=========================
 def convert_slow_hdf_to_existing_png(hdf_list):
     """
-    Convert each .hdf path to its corresponding .png path by naming pattern,
+    Convert each .hdf path (lev1 or lev15) to its corresponding .png path by timestamp match,
     and return only those that actually exist on disk.
 
     Parameters:
@@ -141,19 +154,19 @@ def convert_slow_hdf_to_existing_png(hdf_list):
     for hdf_path in hdf_list:
         try:
             hdf_filename = os.path.basename(hdf_path)
-            # Extract date from the filename
-            if "T" in hdf_filename:
-                # timestamp_part = hdf_filename.split("T")[1]
-                date_part = hdf_filename.split("T")[0].split('.')[-1]  # e.g., '2025-04-10'
+            # Extract timestamp part
+            if "T" in hdf_filename and hdf_filename.endswith(".hdf"):
+                timestamp_part = hdf_filename.split("T")[1].split("Z")[0]  # e.g., "123456"
+                date_part = hdf_filename.split("T")[0].split('.')[-1]      # e.g., "2025-05-10"
                 yyyy, mm, dd = date_part.split('-')
             else:
-                continue  # skip if filename format unexpected
-
-            png_filename = hdf_filename.replace('.lev1.5_', '.synop_').replace('.hdf', '.png')
-            # Full target .png path
+                continue  # skip if format unexpected
+            # Reconstruct PNG filename
+            # Example: ovro-lwa-352.synop_mfs_10s.2025-05-10T123456Z.image_I.png
+            prefix = "ovro-lwa-352.synop_mfs_10s"
+            png_filename = f"{prefix}.{date_part}T{timestamp_part}Z.image_I.png"
+            # png_filename = hdf_filename.replace('.lev1.5_', '.synop_').replace('.hdf', '.png')
             png_path = f"/common/webplots/lwa-data/qlook_images/slow/synop/{yyyy}/{mm}/{dd}/{png_filename}"
-            print(f"png_path: {png_path}")
-
             if os.path.exists(png_path):
                 png_list.append(png_path)
         except Exception as e:
@@ -163,7 +176,61 @@ def convert_slow_hdf_to_existing_png(hdf_list):
 # png_files = convert_slow_hdf_to_existing_png(slow_hdf_files)
 
 
+##=========================
+def convert_png_to_urls(png_paths):
+    """
+    Convert full PNG file paths to public HTTPS URLs based on path pattern.
 
+    Parameters:
+        png_paths (list): Full local PNG file paths (e.g., /common/webplots/.../png)
+
+    Returns:
+        List of HTTPS URLs pointing to each image.
+    """
+    urls = []
+    for png_path in sorted(png_paths):
+        try:
+            png_filename = os.path.basename(png_path)
+
+            # Extract date/time string for folder and filename
+            timestamp_part = png_filename.split("T")[1].split("Z")[0]  # e.g., "123456"
+            date_str = png_filename.split("T")[0].split(".")[-1]  # e.g., 2025-05-10
+            yyyy, mm, dd = date_str.split("-")
+            url = f"https://ovsa.njit.edu/lwa-data/qlook_images/slow/synop/{yyyy}/{mm}/{dd}/{png_filename}"
+            urls.append(url)
+        except Exception as e:
+            print(f"Failed to convert {png_path} to URL: {e}")
+            continue
+    return urls
+
+
+##=========================
+def filter_files_by_cadence(times, files, cadence_sec):
+    """
+    Filter (time, file) pairs to enforce a minimum time spacing (cadence).
+
+    Parameters:
+        times (list of datetime): observation times
+        files (list of str): file paths (must match 1-to-1 with times)
+        cadence_sec (int): minimum time spacing in seconds
+
+    Returns:
+        (filtered_times, filtered_files)
+    """
+    if not times or not files or len(times) != len(files):
+        return times, files  # return original if mismatch
+
+    filtered_times = [times[0]]
+    filtered_files = [files[0]]
+    last_time = times[0]
+
+    for i in range(1, len(times)):
+        if (times[i] - last_time).total_seconds() >= cadence_sec:
+            filtered_times.append(times[i])
+            filtered_files.append(files[i])
+            last_time = times[i]
+
+    return filtered_times, filtered_files
 
 
 ##=========================
@@ -172,20 +239,33 @@ def get_lwafilelist_from_database():
 
     start = request.form['start']
     end = request.form['end']
-    # print("start_date22", start, end)
+    cadence = request.form.get('cadence', None)
+    cadence_sec = int(cadence) if cadence else None
+    print("qqq,cadence_sec", cadence_sec)
     if not start or not end:
         raise ValueError("Start and end times are required.")
 
-    file_lists, _ = get_lwa_file_lists_from_mysql(start, end)
+    file_lists, obs_times = get_lwa_file_lists_from_mysql(start, end)
 
-    print(f"Found {len(file_lists['spec_fits'])} spec_fits files")
-    print(f"Found {len(file_lists['slow_lev1'])} slow_lev1_hdf files")
-    print(f"Found {len(file_lists['slow_lev15'])} slow_lev15_hdf files")
+    if cadence_sec:
+        for key in ['slow_lev1', 'slow_lev15']:
+            obs_times[key], file_lists[key] = filter_files_by_cadence(
+                obs_times[key], file_lists[key], cadence_sec
+            )
 
-    # Convert local HDF paths to public HTTPS URLs
-    file_lists['spec_fits']   = convert_local_to_urls(file_lists['spec_fits'])
-    file_lists['slow_lev1']   = convert_local_to_urls(file_lists['slow_lev1'])
-    file_lists['slow_lev15']  = convert_local_to_urls(file_lists['slow_lev15'])
+    print(f"Query: Found {len(file_lists['spec_fits'])} spec_fits files")
+    print(f"Query: Found {len(file_lists['slow_lev1'])} slow_lev1_hdf files")
+    print(f"Query: Found {len(file_lists['slow_lev15'])} slow_lev15_hdf files")
+
+    # # Convert local HDF paths to public HTTPS URLs
+    # file_lists['spec_fits']   = convert_local_to_urls(file_lists['spec_fits'])
+    # file_lists['slow_lev1']   = convert_local_to_urls(file_lists['slow_lev1'])
+    # file_lists['slow_lev15']  = convert_local_to_urls(file_lists['slow_lev15'])
+
+    # Convert local HDF paths to file names only
+    file_lists['spec_fits']   = convert_local_to_filename(file_lists['spec_fits'])
+    file_lists['slow_lev1']   = convert_local_to_filename(file_lists['slow_lev1'])
+    file_lists['slow_lev15']  = convert_local_to_filename(file_lists['slow_lev15'])
 
     return jsonify({
         "spec_fits": file_lists['spec_fits'],
@@ -193,22 +273,138 @@ def get_lwafilelist_from_database():
         "slow_lev15": file_lists['slow_lev15']
     })
 
-    # slow_hdf_files = (file_lists['slow_hdf'])[:20]
-    # img_png_files = convert_slow_hdf_to_existing_png(slow_hdf_files)
-    # movie_path = generate_movie_from_pngs(img_png_files)
-    # print(f"movie_path: {movie_path}")
-    # # print(f"png_files: {img_png_files}")
-    # spec_png_files = "https://ovsa.njit.edu/lwa/extm/daily/" + os.path.basename(img_png_files[0]).split("T")[0].split('.')[-1].replace('-', '') + '.png'
-    # print(f"spec_png_files: {spec_png_files}")
 
-    # return jsonify({
-    # "spec_fits": file_lists['spec_fits'],
-    # "slow_hdf": file_lists['slow_hdf'],
-    # "fast_hdf": file_lists['fast_hdf'],
-    # "movie_path": movie_path,
-    # "spec_png_path":spec_png_files
-    # })
+# #=========================
+def generate_html_movie_from_png(png_paths):
+    """
+    Generate an HTML movie file from a list of PNG paths using a JavaScript-based animation template.
 
+    Parameters:
+        png_paths (list): List of full PNG file paths
+
+    Returns:
+        str: Public URL of the generated HTML movie
+    """
+    if not png_paths:
+        raise ValueError("No PNG files provided.")
+
+    try:
+        png_paths = sorted(png_paths)[:20]  # Limit to first 200 frames
+        first_png = png_paths[0]
+        if "T" not in first_png:
+            raise ValueError("Filename missing timestamp.")
+
+        # Extract date/time string for folder and filename
+        timestamp_part = first_png.split("T")[1].split("Z")[0]  # e.g., "123456"
+        date_str = first_png.split("T")[0].split(".")[-1]  # e.g., 2025-05-10
+        yyyy, mm, dd = date_str.split("-")
+        output_name = f"movie_{date_str}T{timestamp_part}Z.html"
+        # output_dir = f"/common/webplots/lwa-data/qlook_images/slow/synop/{yyyy}/{mm}/{dd}"
+        # os.makedirs(output_dir, exist_ok=True)
+        output_dir = f"/common/webplots/lwa-data/tests/test-movie-can-rm-anytime/"
+        html_path = os.path.join(output_dir, output_name)
+        print(f"???html_path: {html_path}")
+
+        # Read image dimensions
+        img = imread(first_png)
+        ysize, xsize = img.shape[:2]
+        if xsize > 1125:
+            xfsize = xsize * 3 // 4
+            yfsize = ysize * 3 // 4
+        else:
+            xfsize = xsize
+            yfsize = ysize
+
+        # Read template
+        # template_path = "/nas5/ovro-lwa-data/beam/software/html_movie_example.html"
+        template_path = "/data1/xychen/flaskenv/html_movie_example.html"
+        if not os.path.exists(template_path):
+            raise FileNotFoundError("Template HTML file not found.")
+        with open(template_path, "r") as f:
+            lines = f.readlines()
+
+        new_lines = []
+        inserted_url_path = False
+
+        for i, line in enumerate(lines):
+            if "<script" in line and not inserted_url_path:
+                new_lines.append(line)
+                new_lines.append(f'var url_path = "https://ovsa.njit.edu/lwa-data/qlook_images/slow/synop/{yyyy}/{mm}/{dd}";\n')
+                inserted_url_path = True
+            elif "var imax" in line:
+                new_lines.append(f"var imax = {len(png_paths)};\n")
+            elif "var iwidth" in line:
+                new_lines.append(f"var iwidth = {xsize}, iheight = {ysize};\n")
+            elif "NAME=animation" in line:
+                new_lines.append(f'<img NAME=animation ALT="FRAME" width={xfsize} height={yfsize}>\n')
+            elif "urls[" in line:
+                break  # stop before appending URL list
+            else:
+                new_lines.append(line)
+
+        # Append image URLs
+        for i, path in enumerate(png_paths):
+            fname = os.path.basename(path)
+            new_lines.append(f'urls[{i}]=url_path+"/{fname}";\n')
+
+        # Find remaining lines after image list (past 2nd "urls[" line)
+        post_lines = []
+        urls_found = 0
+        for line in lines:
+            if "urls[" in line:
+                urls_found += 1
+                if urls_found == 2:
+                    post_lines.append(line)
+            elif urls_found >= 2:
+                post_lines.append(line)
+
+        new_lines.extend(post_lines)
+
+        # Write HTML file
+        with open(html_path, "w") as f:
+            f.writelines(new_lines)
+
+        movie_url = f"https://ovsa.njit.edu/lwa-data/tests/test-movie-can-rm-anytime/{output_name}"
+
+        # Return URL
+        return movie_url
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate HTML movie: {e}")
+
+
+#=========================works
+@example.route('/generate_html_movie', methods=['POST'])
+def generate_html_movie():
+    selected_files_json = request.form.get('selected_files', '')
+    if not selected_files_json:
+        return "No files selected", 400
+
+    try:
+        selected_files = json.loads(selected_files_json)
+    except Exception as e:
+        return f"Invalid JSON: {e}", 400
+    print("??selected_files", selected_files[0])
+
+    # selected_files eg. 'ovro-lwa-352.lev1_mfs_10s.2025-05-10T00000Z.image_l.hdf'
+    # png file eg. 'ovro-lwa-352.synop_mfs_10s.2025-05-10T000208Z.image_I.png'
+    try:
+        # ##===== exist movie.html
+        # first_file = selected_files[0]
+        # date_str = first_file.split("T")[0].split(".")[-1]  # e.g., 2025-05-10
+        # yyyy, mm, dd = date_str.split("-")
+        # movie_url = f"https://ovsa.njit.edu/lwa-data/qlook_images/slow/synop/{yyyy}/{mm}/{dd}/movie_{date_str}.html"
+
+        ##===== generate a new movie.html
+        png_files = convert_slow_hdf_to_existing_png(selected_files)
+        print(f"png_files: {png_files[:2]}")
+        movie_url = generate_html_movie_from_png(png_files)
+        print("??movie_url", movie_url)
+        print(f"Generate_html_movie: success! {movie_url}")
+
+        return jsonify({"movie_url": movie_url})
+    except Exception as e:
+        return f"Could not construct movie path: {e}", 500
 
 
 ##=========================
@@ -224,7 +420,6 @@ def get_spec_and_movie_paths(slow_hdf_files):
     except Exception as e:
         spec_png = None
         print("Spec image link generation failed:", e)
-
     return spec_png, movie_path
 
 ##=========================
@@ -266,9 +461,6 @@ def get_lwa_spec_movie_from_database():
 
 
 
-
-
-
 # ##=========================
 '''Several method to downsample times
 '''
@@ -285,7 +477,6 @@ def bin_times(times, freq='1min'):
     df = pd.DataFrame({'time': pd.to_datetime(times)})
     df['binned'] = df['time'].dt.floor(freq)
     return df['binned'].drop_duplicates().tolist()
-
 
 def segment_continuous_times(times, gap='1min'):
     """
@@ -349,85 +540,41 @@ def compress_time_segments(times, max_gap_seconds=60):
     segments.append((start, prev))
     return segments
 
-
-
 color_map = {
     'spec_fits': '#1f77b4',  # muted blue
     'slow_lev1':  '#ff7f0e',  # safety orange
     'slow_lev15':  '#2ca02c'   # green
 }
 
-
 # ##=========================
 @example.route('/plot', methods=['POST'])
 def plot():
     start = request.form['start']
     end = request.form['end']
+    # cadence = request.form.get('cadence')
+    # cadence_sec = int(cadence) if cadence and cadence.strip().isdigit() else None
+    cadence = request.form.get('cadence', None)
+    cadence_sec = int(cadence) if cadence else None
+    print("ppp, cadence_sec", cadence_sec)
 
     try:
         start = datetime.strptime(start, "%Y-%m-%dT%H:%M:%S") - timedelta(days=0)
         end = datetime.strptime(end, "%Y-%m-%dT%H:%M:%S") + timedelta(days=0)
     except ValueError:
         return jsonify({'error': 'Invalid date format'}), 400
-
     if start > end:
         return jsonify({'error': 'End date must be after start date'}), 400
 
     file_lists, obs_times = get_lwa_file_lists_from_mysql(Time(start).isot, Time(end).isot)
+    if cadence_sec:
+        for key in ['slow_lev1', 'slow_lev15']:
+            obs_times[key], file_lists[key] = filter_files_by_cadence(
+                obs_times[key], file_lists[key], cadence_sec
+            )
 
     fig = go.Figure()
     labels = ['spec_fits', 'slow_lev1', 'slow_lev15']
     labels_fig = ['spec_fits', 'image_lev1', 'image_lev15']
-
-    # for label in labels:
-    #     times = obs_times.get(label, [])
-    #     y_values = [label] * len(times)
-
-    #     label_with_count = f"N({label}) = {len(times)}" if times else f"N({label}) = 0"
-
-    #     # Ensure a trace is added even if there are no files
-    #     fig.add_trace(go.Scatter(
-    #         x=times if times else [None],
-    #         y=y_values if times else [label],
-    #         mode='markers',
-    #         marker=dict(size=8),
-    #         name=label_with_count,
-    #         showlegend=True# if times else False
-    #     ))
-
-
-    # for label in labels:
-    #     times = obs_times.get(label, [])
-    #     times_ds = downsample(times)
-
-    #     label_with_count = f"N({label}) = {len(times)}"
-
-    #     fig.add_trace(go.Scatter(
-    #         x=times_ds if times_ds else [None],
-    #         y=[label] * len(times_ds) if times_ds else [label],
-    #         mode='markers',
-    #         marker=dict(size=6),
-    #         name=label_with_count,
-    #         showlegend=True
-    #     ))
-
-
-
-    # for label in labels:
-    #     times = obs_times.get(label, [])
-    #     binned_times = bin_times(times, freq='1min')
-    #     y_values = [label] * len(binned_times)
-
-    #     label_with_count = f"N({label}) = {len(times)}"
-
-    #     fig.add_trace(go.Scatter(
-    #         x=binned_times if binned_times else [None],
-    #         y=y_values if binned_times else [label],
-    #         mode='markers',
-    #         marker=dict(size=6),
-    #         name=label_with_count
-    #     ))
-
 
     for i, (label, label_fig) in enumerate(zip(labels, labels_fig)):
     # for ll, label in enumerate(labels):
@@ -447,31 +594,10 @@ def plot():
                 showlegend=True# if times else False
             ))
         else:
-            # segments = segment_continuous_times(times, gap='1min')
-            # # for seg in segments:
-            # #     fig.add_trace(go.Scatter(
-            # #         x=seg if seg else [None],
-            # #         y=[label] * len(seg),
-            # #         mode='lines',
-            # #         line=dict(width=4, color=color_map[label]),
-            # #         name=label_with_count,
-            # #         showlegend=(seg == segments[0])  # Show legend only once per label
-            # #     ))
-
-            # for i, seg in enumerate(segments):
-            #     fig.add_trace(go.Scatter(
-            #         x=seg,
-            #         y=[label] * len(seg),
-            #         mode='lines+markers',
-            #         line=dict(width=5, color=color_map[label]),
-            #         # marker=dict(size=3, color=color_map[label]),
-            #         name=label_with_count,
-            #         showlegend=(i == 0)
-            #     ))
             if label == 'slow_lev1':
                 segments = compress_time_segments(times, max_gap_seconds=600)#180
             else:
-                segments = compress_time_segments(times, max_gap_seconds=300)
+                segments = compress_time_segments(times, max_gap_seconds=600)
 
             show_legend = True
             for i_st, i_ed in segments:
@@ -484,26 +610,6 @@ def plot():
                     showlegend=show_legend
                 ))
                 show_legend = False
-
-
-            # segments = compress_time_segments(times, max_gap_seconds=60)
-            # show_legend = True
-            # min_duration = timedelta(seconds=30)
-
-            # for i_st, i_ed in segments:
-            #     # Enforce minimum visual duration
-            #     if (i_ed - i_st) < min_duration:
-            #         i_ed = i_st + min_duration
-
-            #     fig.add_trace(go.Scatter(
-            #         x=[i_st, i_ed],
-            #         y=[label, label],
-            #         mode='lines',
-            #         line=dict(width=15, color=color_map[label], shape='hv'),
-            #         name=label_with_count,
-            #         showlegend=show_legend
-            #     ))
-            #     show_legend = False
 
     print(f"Plot Data Availability...")
 
@@ -523,8 +629,99 @@ def plot():
 
 
 
+# ##=========================
+def extract_timestamp_from_filename(filename):
+    """
+    Extract YYYY-MM-DDTHHMMSSZ-like timestamp from filename and convert to YYYYMMDDTHHMMSS
+    """
+    match = re.search(r"\d{4}-\d{2}-\d{2}T\d{6}", filename)
+    if match:
+        return match.group(0).replace("-", "").replace(":", "")
+    else:
+        return "UNKNOWN"
 
 
+@example.route('/generate_bundle/<bundle_type>', methods=['POST'])
+def generate_data_bundle(bundle_type):
+    start = request.form.get('start')
+    end = request.form.get('end')
+
+    cadence = request.form.get('cadence', None)
+    cadence_sec = int(cadence) if cadence else None
+
+    if not start or not end:
+        return "Start and end parameters are required", 400
+
+    file_lists, obs_times = get_lwa_file_lists_from_mysql(start, end)
+
+    if bundle_type not in file_lists:
+        return f"Invalid bundle type: {bundle_type}", 400
+
+    if cadence_sec and bundle_type in ['slow_lev1', 'slow_lev15']:
+        obs_times[bundle_type], file_lists[bundle_type] = filter_files_by_cadence(
+            obs_times[bundle_type], file_lists[bundle_type], cadence_sec
+        )
+
+    # for selected_files
+    selected_files_json = request.form.get('selected_files')
+    if selected_files_json:
+        try:
+            selected_files = set(json.loads(selected_files_json))
+            file_paths = [f for f in file_lists[bundle_type] if os.path.basename(f) in selected_files]
+        except Exception as e:
+            return f"Invalid selected_files format: {e}", 400
+    else:
+        file_paths = file_lists[bundle_type]
+
+    # file_paths = file_lists[bundle_type]
+    if not file_paths:
+        return f"No files found for {bundle_type}", 404
+
+    if len(file_paths) > 10:
+        file_paths = file_paths[:10]
+        print(f"Limiting download to first 1000 files out of {len(file_paths)}")
+
+    bundle_names = {
+        'spec_fits': 'ovro-lwa-spec',
+        'slow_lev1': 'ovro-lwa-image-lev1',
+        'slow_lev15': 'ovro-lwa-image-lev15'
+    }
+    start_time_str = extract_timestamp_from_filename(os.path.basename(file_paths[0]))
+    end_time_str = extract_timestamp_from_filename(os.path.basename(file_paths[-1]))
+    cadence_suffix = f"_cad{cadence_sec}s" if cadence_sec else ""
+
+    archive_label = bundle_names.get(bundle_type, bundle_type)
+    archive_filename = f"{archive_label}_{start_time_str}_{end_time_str}{cadence_suffix}.tar.gz"
+    # Create a permanent bundle output path
+    bundle_dir = "/data1/xychen/flaskenv/lwa_data_query_request"
+    os.makedirs(bundle_dir, exist_ok=True)
+    # archivse_path = os.path.join(bundle_dir, f"{bundle_type}_{start_time_str}_{end_time_str}.tar.gz")
+    archive_path = os.path.join(bundle_dir, archive_filename)
+
+    # Create .tar
+    if not os.path.exists(archive_path):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for path in file_paths:
+                if os.path.exists(path):
+                    shutil.copy(path, temp_dir)
+            shutil.make_archive(
+                base_name=archive_path.replace(".tar.gz", ""),
+                format="gztar",
+                root_dir=temp_dir
+            )
+    print(f"Generate bundle for {bundle_type} from {start} to {end}")
+    return jsonify({"archive_name": os.path.basename(archive_path)})
+
+
+# ##=========================
+@example.route('/download_ready_bundle/<archive_name>', methods=['GET'])
+def download_ready_bundle(archive_name):
+    bundle_dir = "/data1/xychen/flaskenv/lwa_data_query_request"
+    archive_path = os.path.join(bundle_dir, archive_name)
+    if os.path.exists(archive_path):
+        return send_file(archive_path, as_attachment=True, download_name=archive_name)
+    else:
+        return f"{archive_name} not found", 404
 
 
 # ##=========================

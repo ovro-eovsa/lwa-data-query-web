@@ -15,7 +15,7 @@
 {% assets "example_js" %}
 <script type="text/javascript" src="{{ ASSET_URL }}"></script>
 {% endassets %}
-<!-- <script src="{{ url_for('static', filename='js/example.js') }}"></script> -->
+<script src="{{ url_for('static', filename='js/example.js') }}"></script>
 <script type="text/javascript">
   var isOvsa = {{ 'true' if hostname == 'ovsa' else 'false' }};
 </script>
@@ -34,14 +34,23 @@
 <form class="form-inline mt-2">
 <!-- <form id="time-form" class="form-inline mt-2"> -->
   <div class="form-group mb-2">
-    <label for="start">Time range:</label>
+    <label for="start" class="mr-2">Time range:</label>
     <input type="text" placeholder="Start Time" class="form-control datetime-picker" id="start">
   </div>
   <div class="form-group mx-sm-3 mb-2">
     <input type="text" placeholder="End time" class="form-control datetime-picker" id="end">
   </div>
+
+  <!-- Cadence input -->
+  <div class="form-group mx-sm-3 mb-2">
+    <label for="cadence" class="mr-2">Cadence (s):</label>
+    <input type="number" id="cadence" class="form-control" min="1" step="1" placeholder="e.g. 30">
+  </div>
+
   <button type="submit" id="query-btn" class="btn btn-primary mb-2">Query</button>
 </form>
+
+
 
 
 <div class="mt-4">
@@ -49,37 +58,58 @@
   <div class="row text-center mb-2">
     <div class="col-sm-4">
       <h5>spec_fits</h5>
-      <button id="download-spec" class="btn btn-outline-secondary btn-sm">Download Spec_fits.txt</button>
+      <!-- <button id="download-spec" class="btn btn-outline-secondary btn-sm">Download spec_fits.tar</button> -->
+      <div>
+        <!-- <button onclick="selectAll('spec-list')" class="btn btn-outline-secondary btn-sm">Select All</button> -->
+        <button id="generate-spec_fits" class="btn btn-outline-secondary btn-sm">Generate .tar</button>
+        <button id="download-spec_fits" class="btn btn-outline-success btn-sm" disabled>Download .tar</button>
+      </div>
     </div>
     <div class="col-sm-4">
       <h5>image_lev1</h5>
-      <button id="download-image-lev1" class="btn btn-outline-secondary btn-sm">Download image_lev1_hdf.txt</button>
+      <div>
+        <!-- <button onclick="selectAll('image-lev1-list')" class="btn btn-outline-secondary btn-sm">Select All</button> -->
+        <button id="generate-slow_lev1" class="btn btn-outline-secondary btn-sm">Generate .tar</button>
+        <button id="download-slow_lev1" class="btn btn-outline-success btn-sm" disabled>Download .tar</button>
+        <button id="generate-movie-slow_lev1" class="btn btn-outline-info btn-sm">Generate Movie</button>
+      </div>
     </div>
     <div class="col">
       <h5>image_lev15</h5>
-      <button id="download-image-lev15" class="btn btn-outline-secondary btn-sm">Download image_lev15_hdf.txt</button>
+      <div>
+        <!-- <button onclick="selectAll('image-lev15-list')" class="btn btn-outline-secondary btn-sm">Select All</button> -->
+        <button id="generate-slow_lev15" class="btn btn-outline-secondary btn-sm">Generate .tar</button>
+        <button id="download-slow_lev15" class="btn btn-outline-success btn-sm" disabled>Download .tar</button>
+        <button id="generate-movie-slow_lev15" class="btn btn-outline-info btn-sm">Generate Movie</button>
+      </div>
+      <!-- <button id="download-image-lev15" class="btn btn-outline-secondary btn-sm">Download image_lev15_hdf.tar</button> -->
     </div>
   </div>
-
 
   <div class="row">
     <div class="col-sm-4">
-      <div id="spec-box" style="border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
-        <!-- <ul id="spec-list" class="list-unstyled mb-0"></ul> -->
-        <ul id="spec-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul>
+      <div id="spec-box" style="font-size: 12px; border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
+        <!-- <ul id="spec-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul> -->
+        <!-- <select id="spec-list" multiple size="10" class="form-select form-select-sm"></select> -->
+        <select id="spec-list" multiple size="10" class="form-select form-select-sm" style="width: 100%; border: none; height: 100%;"></select>
       </div>
     </div>
     <div class="col-sm-4">
-      <div id="image-lev1-box" style="border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
-        <ul id="image-lev1-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul>
+      <div id="image-lev1-box" style="font-size: 12px; border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
+        <!-- <ul id="image-lev1-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul> -->
+        <!-- <select id="image-lev1-list" multiple size="10" class="form-select form-select-sm"></select> -->
+        <select id="image-lev1-list" multiple size="10" class="form-select form-select-sm" style="width: 100%; border: none; height: 100%;"></select>
       </div>
     </div>
-    <div class="col">
-      <div id="image-lev15-box" style="border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
-        <ul id="image-lev15-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul>
+    <div class="col-sm-4">
+      <div id="image-lev15-box" style="font-size: 12px; border: 1px solid #ccc; padding: 10px; max-height: 200px; overflow-y: auto;">
+        <!-- <ul id="image-lev15-list" class="list-unstyled mb-0" style="font-size: 12px;"></ul> -->
+        <!-- <select id="image-lev15-list" multiple size="10" class="form-select form-select-sm"></select> -->
+        <select id="image-lev15-list" multiple size="10" class="form-select form-select-sm" style="width: 100%; border: none; height: 100%;"></select>
       </div>
     </div>
   </div>
+
 </div>
 
 
